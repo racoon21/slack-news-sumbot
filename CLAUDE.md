@@ -30,12 +30,13 @@ Google Cloud Platform
 ## 기술 스택
 
 - **언어**: Python 3.11+
+- **패키지 관리**: `uv` (pyproject.toml + uv.lock)
 - **Slack 연동**: `slack_sdk`
 - **뉴스 요약**: Claude API (`anthropic` SDK)
 - **링크 메타데이터 추출**: `requests` + `beautifulsoup4` (OG 태그 파싱)
 - **웹 프레임워크**: `flask` (Cloud Run HTTP 트리거 수신용)
 - **설정 관리**: 환경 변수 (GCP Secret Manager 연동)
-- **배포**: Docker → Google Cloud Run Job + Cloud Scheduler
+- **배포**: Docker (uv 기반 빌드) → Google Cloud Run Job + Cloud Scheduler
 
 ## 핵심 기능 흐름
 
@@ -52,7 +53,9 @@ Google Cloud Platform
 slack-news-sumbot/
 ├── CLAUDE.md              # 개발 계획 (이 파일)
 ├── README.md              # 사용 가이드
-├── requirements.txt       # Python 의존성
+├── pyproject.toml         # 프로젝트 메타데이터 + 의존성 정의 (uv)
+├── uv.lock                # 의존성 락파일 (uv, 커밋 필수)
+├── .python-version        # Python 버전 고정 (uv 자동 생성)
 ├── .env.example           # 로컬 개발용 환경 변수 템플릿
 ├── main.py                # 엔트리포인트 (Flask 앱 + 즉시 실행 모드)
 ├── bot/
@@ -62,7 +65,7 @@ slack-news-sumbot/
 │   ├── summarizer.py      # Claude API로 뉴스 요약
 │   └── formatter.py       # Slack 메시지 포맷 (표 형태)
 ├── config.py              # 설정 로드 (환경 변수)
-├── Dockerfile             # Cloud Run 배포용
+├── Dockerfile             # Cloud Run 배포용 (uv 기반 멀티스테이지 빌드)
 ├── deploy/
 │   └── deploy.sh          # GCP 배포 스크립트
 └── tests/
@@ -111,7 +114,8 @@ slack-news-sumbot/
 ## 구현 단계
 
 ### Phase 1: 기본 구조 세팅
-- [ ] `requirements.txt` 작성
+- [ ] `uv init` 프로젝트 초기화 + `pyproject.toml` 의존성 정의
+- [ ] `uv add slack_sdk anthropic requests beautifulsoup4 flask python-dotenv`
 - [ ] `.env.example` 작성
 - [ ] `config.py` - 환경 변수 로드
 
@@ -155,20 +159,27 @@ _총 2건의 뉴스가 공유되었습니다._
 ## 개발 명령어
 
 ```bash
-# 의존성 설치
-pip install -r requirements.txt
+# 프로젝트 초기화 (최초 1회)
+uv init
+uv add slack_sdk anthropic requests beautifulsoup4 flask python-dotenv
+
+# 개발 의존성 추가
+uv add --dev pytest
+
+# 의존성 동기화 (clone 후)
+uv sync
 
 # 환경 변수 설정 (로컬 개발)
 cp .env.example .env  # 값 채워넣기
 
 # 즉시 실행 (로컬 테스트)
-python main.py --now
+uv run python main.py --now
 
 # Flask 서버 실행 (로컬에서 HTTP 트리거 테스트)
-python main.py
+uv run python main.py
 
 # 테스트
-pytest tests/
+uv run pytest tests/
 
 # Docker 빌드 & 로컬 테스트
 docker build -t slack-news-sumbot .
@@ -176,6 +187,24 @@ docker run --env-file .env slack-news-sumbot
 
 # GCP 배포
 bash deploy/deploy.sh
+```
+
+## Dockerfile 예시 (uv 기반 멀티스테이지 빌드)
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+
+WORKDIR /app
+
+# 의존성 파일 복사 및 설치 (캐시 레이어 활용)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# 소스 코드 복사
+COPY . .
+RUN uv sync --frozen --no-dev
+
+CMD ["uv", "run", "python", "main.py", "--now"]
 ```
 
 ## GCP 배포 절차 (deploy.sh 내용)
