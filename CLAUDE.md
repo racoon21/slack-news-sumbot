@@ -34,9 +34,9 @@ Google Cloud Platform
 - **Slack 연동**: `slack_sdk`
 - **뉴스 요약**: Claude API (`anthropic` SDK)
 - **링크 메타데이터 추출**: `requests` + `beautifulsoup4` (OG 태그 파싱)
-- **웹 프레임워크**: `flask` (Cloud Run HTTP 트리거 수신용)
 - **설정 관리**: 환경 변수 (GCP Secret Manager 연동)
 - **배포**: Docker (uv 기반 빌드) → Google Cloud Run Job + Cloud Scheduler
+- **참고**: Cloud Run Job은 단순 스크립트 실행형이므로 Flask 등 웹 프레임워크 불필요
 
 ## 핵심 기능 흐름
 
@@ -57,7 +57,7 @@ slack-news-sumbot/
 ├── uv.lock                # 의존성 락파일 (uv, 커밋 필수)
 ├── .python-version        # Python 버전 고정 (uv 자동 생성)
 ├── .env.example           # 로컬 개발용 환경 변수 템플릿
-├── main.py                # 엔트리포인트 (Flask 앱 + 즉시 실행 모드)
+├── main.py                # 엔트리포인트 (Cloud Run Job 실행 스크립트)
 ├── bot/
 │   ├── __init__.py
 │   ├── slack_client.py    # Slack API 연동 (메시지 조회 + 전송)
@@ -111,35 +111,79 @@ slack-news-sumbot/
 - Artifact Registry: 500MB 스토리지 무료
 - **하루 1회 실행 기준 무료 범위 내 충분**
 
+## 모듈별 핵심 함수 시그니처
+
+```python
+# config.py — 환경 변수를 읽어 설정 객체 반환
+def load_config() -> dict:
+    """SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, ANTHROPIC_API_KEY, TIMEZONE 로드.
+    필수 변수 누락 시 명확한 에러 메시지와 함께 종료."""
+
+# bot/slack_client.py — Slack API 래퍼
+def fetch_yesterday_messages(token: str, channel_id: str, tz: str) -> list[dict]:
+    """전날 00:00~23:59(KST) 메시지 조회. 페이지네이션 처리 포함.
+    Slack API 에러 시 예외 발생."""
+
+def post_summary(token: str, channel_id: str, text: str) -> None:
+    """채널에 요약 메시지 전송. 메시지가 비어있으면 전송하지 않음."""
+
+# bot/link_extractor.py — URL 추출 + 메타데이터
+def extract_links(messages: list[dict]) -> list[str]:
+    """메시지에서 URL 추출. Slack 포맷 <http://...|label> 처리.
+    중복 URL 제거."""
+
+def fetch_metadata(url: str) -> dict:
+    """URL에 접속하여 제목(title, og:title) 추출.
+    타임아웃 5초, 접속 실패 시 URL 자체를 제목으로 사용 (에러 무시)."""
+
+# bot/summarizer.py — Claude API 요약
+def summarize_articles(api_key: str, articles: list[dict]) -> list[dict]:
+    """여러 기사를 한번의 Claude API 호출로 일괄 요약 (비용 절감).
+    각 기사에 title + one_line_summary 필드 추가.
+    API 호출 실패 시 요약 없이 제목만 반환."""
+
+# bot/formatter.py — Slack 메시지 포맷
+def format_summary(articles: list[dict], date_str: str) -> str:
+    """Slack mrkdwn 표 형식으로 변환. 기사 0건이면 '공유된 뉴스가 없습니다' 반환."""
+
+# main.py — 엔트리포인트
+def run() -> None:
+    """전체 파이프라인 실행: 설정 로드 → 메시지 수집 → 링크 추출 →
+    메타데이터 수집 → AI 요약 → 포맷팅 → Slack 전송.
+    --now 플래그 또는 Cloud Run Job에서 직접 실행."""
+```
+
+## 에지 케이스 처리
+
+| 상황 | 처리 방식 |
+|------|-----------|
+| 전날 뉴스 0건 | "공유된 뉴스가 없습니다" 메시지 전송 (빈 표 방지) |
+| 링크 접속 실패/타임아웃 | URL 자체를 제목으로 사용, 요약은 "-"로 표시 |
+| Claude API 호출 실패 | 제목만 표시, 요약 컬럼은 "요약 실패"로 표시 |
+| Slack API 토큰 만료 | 명확한 에러 로그 출력 후 exit(1) |
+| 메시지에 URL 없음 (텍스트만) | 해당 메시지 건너뜀 |
+| 동일 URL 중복 공유 | 중복 제거 후 1건만 처리 |
+
 ## 구현 단계
 
 ### Phase 1: 기본 구조 세팅
 - [ ] `uv init` 프로젝트 초기화 + `pyproject.toml` 의존성 정의
-- [ ] `uv add slack_sdk anthropic requests beautifulsoup4 flask python-dotenv`
+- [ ] `uv add slack_sdk anthropic requests beautifulsoup4 python-dotenv`
 - [ ] `.env.example` 작성
-- [ ] `config.py` - 환경 변수 로드
+- [ ] `config.py` - 환경 변수 로드 (`load_config()`)
 
-### Phase 2: Slack 메시지 수집
-- [ ] `bot/slack_client.py` - 전날 메시지 조회 기능
-- [ ] `bot/link_extractor.py` - URL 추출 및 OG 태그 파싱
+### Phase 2: Slack 메시지 수집 + 링크 추출
+- [ ] `bot/slack_client.py` - `fetch_yesterday_messages()`, `post_summary()`
+- [ ] `bot/link_extractor.py` - `extract_links()`, `fetch_metadata()`
 
-### Phase 3: 뉴스 요약
-- [ ] `bot/summarizer.py` - Claude API 호출로 뉴스 한줄 요약 생성
+### Phase 3: 뉴스 요약 + 포맷팅
+- [ ] `bot/summarizer.py` - `summarize_articles()` (일괄 요약으로 API 호출 최소화)
+- [ ] `bot/formatter.py` - `format_summary()` (Slack mrkdwn 표)
 
-### Phase 4: 결과 포맷팅 및 전송
-- [ ] `bot/formatter.py` - Slack mrkdwn 형식 표 생성
-- [ ] `bot/slack_client.py` - 요약 결과 채널 전송
-
-### Phase 5: 엔트리포인트
-- [ ] `main.py` - Flask 앱 (HTTP 트리거) + `--now` 즉시 실행 모드
-
-### Phase 6: 배포
+### Phase 4: 엔트리포인트 + 배포
+- [ ] `main.py` - `run()` 파이프라인 (단순 스크립트, Flask 없음)
 - [ ] `Dockerfile` 작성
 - [ ] `deploy/deploy.sh` - GCP 배포 자동화 스크립트
-  - Artifact Registry에 이미지 푸시
-  - Cloud Run Job 생성/업데이트
-  - Cloud Scheduler 설정
-  - Secret Manager 연동
 - [ ] 단위 테스트 작성
 - [ ] README.md 작성
 
@@ -161,7 +205,7 @@ _총 2건의 뉴스가 공유되었습니다._
 ```bash
 # 프로젝트 초기화 (최초 1회)
 uv init
-uv add slack_sdk anthropic requests beautifulsoup4 flask python-dotenv
+uv add slack_sdk anthropic requests beautifulsoup4 python-dotenv
 
 # 개발 의존성 추가
 uv add --dev pytest
@@ -174,9 +218,6 @@ cp .env.example .env  # 값 채워넣기
 
 # 즉시 실행 (로컬 테스트)
 uv run python main.py --now
-
-# Flask 서버 실행 (로컬에서 HTTP 트리거 테스트)
-uv run python main.py
 
 # 테스트
 uv run pytest tests/
